@@ -1,21 +1,42 @@
-"""FastAPI HTTP front-end for TotalSegmentator."""
+"""FastAPI HTTP front-end for TotalSegmentator.
+
+Segmentation can take minutes on CPU. The platform router enforces a 30 s
+response deadline, so /segment is async:
+
+    POST /segment        -> 202 + {"job_id"}                          (returns immediately)
+    GET  /jobs/{id}      -> {"state": "pending|running|done|error", ...}
+    GET  /jobs/{id}/labels -> labels.nii.gz                            (when done)
+
+Jobs are kept in memory; restarting the dyno wipes them.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import tempfile
+import threading
+import time
+import uuid
 from importlib import metadata
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .segment import run_segmentation
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("segmenter")
 
-app = FastAPI(title="dicom-imager-segmenter", version="0.1.0")
+app = FastAPI(title="dicom-imager-segmenter", version="0.2.0")
+
+# job_id -> {"state", "summary", "labels_path", "error", "started_at", "finished_at", "task"}
+_JOBS: dict[str, dict[str, Any]] = {}
+_JOBS_DIR = Path(tempfile.gettempdir()) / "segmenter_jobs"
+_JOBS_DIR.mkdir(exist_ok=True)
 
 
 def _ts_version() -> str:
@@ -23,6 +44,25 @@ def _ts_version() -> str:
         return metadata.version("TotalSegmentator")
     except Exception:
         return "unknown"
+
+
+def _worker(job_id: str, data: bytes, task: str, body_seg: bool):
+    job = _JOBS[job_id]
+    job["state"] = "running"
+    job["started_at"] = time.time()
+    try:
+        labels, summary = run_segmentation(data, task=task, body_seg=body_seg)
+        labels_path = _JOBS_DIR / f"{job_id}.nii.gz"
+        labels_path.write_bytes(labels)
+        job["summary"] = summary
+        job["labels_path"] = str(labels_path)
+        job["state"] = "done"
+    except Exception as exc:  # noqa: BLE001
+        log.exception("job %s failed", job_id)
+        job["error"] = str(exc)
+        job["state"] = "error"
+    finally:
+        job["finished_at"] = time.time()
 
 
 @app.get("/healthz")
@@ -36,11 +76,11 @@ def root():
         "service": "dicom-imager-segmenter",
         "totalsegmentator": _ts_version(),
         "tasks": ["total_fast", "total"],
-        "endpoints": ["/segment", "/healthz"],
+        "endpoints": ["POST /segment", "GET /jobs/{id}", "GET /jobs/{id}/labels", "/healthz"],
     }
 
 
-@app.post("/segment")
+@app.post("/segment", status_code=202)
 async def segment(
     nifti: UploadFile = File(...),
     task: str = Form("total_fast"),
@@ -50,23 +90,48 @@ async def segment(
         raise HTTPException(status_code=400, detail="missing nifti upload")
 
     data = await nifti.read()
-    log.info(
-        "segment task=%s body_seg=%s bytes=%d filename=%s",
-        task, body_seg, len(data), nifti.filename,
-    )
+    job_id = uuid.uuid4().hex
+    _JOBS[job_id] = {
+        "state": "pending",
+        "task": task,
+        "body_seg": body_seg,
+        "input_bytes": len(data),
+        "created_at": time.time(),
+    }
+    log.info("queue job=%s task=%s body_seg=%s bytes=%d", job_id, task, body_seg, len(data))
 
-    try:
-        labels, summary = run_segmentation(data, task=task, body_seg=body_seg)
-    except Exception as exc:  # noqa: BLE001 - propagate as 500 with detail
-        log.exception("segmentation failed")
-        raise HTTPException(status_code=500, detail=f"segmentation failed: {exc}")
+    threading.Thread(
+        target=_worker, args=(job_id, data, task, body_seg), daemon=True
+    ).start()
+    return {"job_id": job_id, "state": "pending"}
 
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    # Hide internal-only fields.
+    return {k: v for k, v in job.items() if k != "labels_path"} | {
+        "labels_url": f"/jobs/{job_id}/labels" if job.get("state") == "done" else None,
+    }
+
+
+@app.get("/jobs/{job_id}/labels")
+def job_labels(job_id: str):
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job["state"] != "done":
+        raise HTTPException(status_code=409, detail=f"job state={job['state']}")
+    labels_path = job["labels_path"]
     headers = {
-        "X-Segmentation-Summary": json.dumps(summary),
+        "X-Segmentation-Summary": json.dumps(job["summary"]),
         "Content-Disposition": 'attachment; filename="labels.nii.gz"',
     }
-    return Response(
-        content=labels,
+    return FileResponse(
+        labels_path,
         media_type="application/octet-stream",
         headers=headers,
+        filename="labels.nii.gz",
     )

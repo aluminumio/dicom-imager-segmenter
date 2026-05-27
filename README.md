@@ -16,7 +16,11 @@ hand-rolled Ruby port lacked.
 
 ## API
 
-### `POST /segment`
+Segmentation can take minutes on CPU. The platform router enforces a 30 s
+response deadline, so `/segment` is async — POST queues a job, then poll
+`/jobs/{id}` until `state == "done"` and fetch `/jobs/{id}/labels`.
+
+### `POST /segment` -> 202 `{"job_id", "state": "pending"}`
 
 Multipart form:
 
@@ -26,26 +30,38 @@ Multipart form:
 | `task`     | string  | no       | `total_fast` | `total`, `total_fast`, ...     |
 | `body_seg` | bool    | no       | `false`      | crops to body region first     |
 
-Response: `application/octet-stream` containing the labels `.nii.gz`. The
-per-class voxel-count summary is returned in the `X-Segmentation-Summary`
-header as JSON:
+### `GET /jobs/{job_id}` -> job state
 
 ```json
 {
+  "state": "done",
   "task": "total_fast",
-  "shape": [512, 512, 70],
-  "spacing_mm": [0.97, 0.97, 5.0],
-  "timings": {"load_s": 0.4, "segmentation_s": 18.2, "read_back_s": 0.6},
-  "nonzero_counts": [
-    {"id": 7, "name": "femur_left", "voxels": 2195205},
-    ...
-  ]
+  "started_at": 1716901130.4,
+  "finished_at": 1716901218.7,
+  "summary": {
+    "task": "total_fast",
+    "shape": [512, 512, 70],
+    "spacing_mm": [0.97, 0.97, 5.0],
+    "timings": {"load_s": 0.4, "segmentation_s": 84.1, "read_back_s": 0.6},
+    "nonzero_counts": [
+      {"id": 7, "name": "femur_left", "voxels": 2195205},
+      ...
+    ]
+  },
+  "labels_url": "/jobs/{job_id}/labels"
 }
 ```
 
+States: `pending`, `running`, `done`, `error` (with `error` field).
+
+### `GET /jobs/{job_id}/labels` -> labels.nii.gz
+
+`application/octet-stream`. The per-class voxel-count summary is also
+echoed in the `X-Segmentation-Summary` response header as JSON.
+
 ### `GET /healthz`
 
-Liveness probe. Returns `{"ok": true}`.
+Liveness probe.
 
 ### `GET /`
 
@@ -63,9 +79,18 @@ uvicorn app.main:app --reload
 Smoke test:
 
 ```bash
-curl -X POST http://localhost:8000/segment \
+# 1. Queue the job
+JOB=$(curl -sS -X POST http://localhost:8000/segment \
   -F "nifti=@/path/to/scan.nii.gz" \
-  -F "task=total_fast" \
+  -F "task=total_fast" | jq -r .job_id)
+
+# 2. Poll until done
+while [ "$(curl -sS http://localhost:8000/jobs/$JOB | jq -r .state)" != "done" ]; do
+  sleep 5
+done
+
+# 3. Fetch labels
+curl -sS http://localhost:8000/jobs/$JOB/labels \
   -o /tmp/labels.nii.gz \
   -D /tmp/labels.headers
 ```
