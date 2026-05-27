@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Pre-download TotalSegmentator weights into the slug so the first request
+# isn't blocked on a 300+ MB download.
+#
+# We only pre-fetch the 3mm "total_fast" weights — that's the only task the
+# spike exercises. Other tasks will lazily download on first use.
+#
+# This hook runs after pip install, with the slug Python on PATH.
+
+set -euo pipefail
+
+echo "-----> Pre-downloading TotalSegmentator weights (total_fast / 3mm)"
+
+# Put the weights cache somewhere persistent inside the slug.
+export TOTALSEG_HOME_DIR="${TOTALSEG_HOME_DIR:-/app/.totalsegmentator}"
+mkdir -p "$TOTALSEG_HOME_DIR"
+
+python - <<'PY'
+import os, sys
+os.environ.setdefault("TOTALSEG_HOME_DIR", "/app/.totalsegmentator")
+try:
+    from totalsegmentator.libs import download_pretrained_weights
+    # Task IDs for the 3mm ("total_fast") model. From totalsegmentator's
+    # python_api: task_id 297 is the 3mm total.
+    download_pretrained_weights(297)
+    print("weights ok")
+except Exception as exc:
+    print(f"weight pre-download skipped: {exc}", file=sys.stderr)
+PY
