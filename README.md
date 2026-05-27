@@ -27,7 +27,7 @@ Multipart form:
 | field      | type    | required | default      | notes                          |
 |------------|---------|----------|--------------|--------------------------------|
 | `nifti`    | file    | yes      | -            | `.nii.gz` scan                 |
-| `task`     | string  | no       | `total_fast` | `total`, `total_fast`, ...     |
+| `task`     | string  | no       | `total_fast` | see Tasks below                |
 | `body_seg` | bool    | no       | `false`      | crops to body region first     |
 
 ### `GET /jobs/{job_id}` -> job state
@@ -58,6 +58,31 @@ States: `pending`, `running`, `done`, `error` (with `error` field).
 
 `application/octet-stream`. The per-class voxel-count summary is also
 echoed in the `X-Segmentation-Summary` response header as JSON.
+
+### Tasks
+
+**Free tasks** (no license required):
+
+| task | modality | classes | notes |
+|---|---|---|---|
+| `total` | CT | 117 (full body) | Default for general anatomy. Includes humerus_left/right, scapula_left/right, clavicula_left/right at 1.5 mm. |
+| `total_fast` | CT | 117 | 3 mm resolution. Quick smoke testing. |
+| `total_mr` | MR | 56 | Free body-coverage MR analog of `total`. |
+| `body`, `body_mr`, `vertebrae`, `lung_vessels`, ... | varies | varies | See [TS docs](https://github.com/wasserth/TotalSegmentator#subtasks) for the full list. |
+
+**Licensed tasks** (require `TOTALSEG_LICENSE` env var; see [Setup](#setup) below):
+
+| task | modality | what it segments | clinical relevance |
+|---|---|---|---|
+| `appendicular_bones` | CT | Distal limb bones (ulna, radius, patella, tibia, fibula, tarsals, metatarsals, phalanges) | Hand/wrist/foot bone-loss work. **Does not include humerus/scapula** — use `total` for those. |
+| `tissue_types` | CT | Subcutaneous fat / muscle / bone (3 classes) | Goutallier-style fatty atrophy ratios. |
+| `tissue_4_types` | CT | Subcutaneous fat / visceral fat / muscle / bone (4 classes) | Same plus visceral fat split. |
+| `tissue_types_mr` | MR | Same as `tissue_types`, MR-trained | Fatty-infiltration assessment on MRI. |
+| `thigh_shoulder_muscles` | CT | Rotator-cuff + thigh musculature with per-muscle labels | **Direct rotator-cuff classifier on CT.** |
+| `thigh_shoulder_muscles_mr` | MR | Same on MR | **Direct rotator-cuff classifier on MR — MRI is the conventional modality for rotator-cuff evaluation.** |
+| `vertebrae_body` | CT | Vertebral body (cortical) sub-segmentation | Bone-density / fracture work; finer than `total`'s whole-vertebra labels. |
+
+License key obtained from <https://backend.totalsegmentator.com/license-academic/> (free academic/non-commercial; commercial requires paid license). Cite [Wasserthal et al., Radiology AI 2023](https://pubs.rsna.org/doi/10.1148/ryai.230024) per the license terms.
 
 ### `GET /healthz`
 
@@ -93,6 +118,16 @@ done
 curl -sS http://localhost:8000/jobs/$JOB/labels \
   -o /tmp/labels.nii.gz \
   -D /tmp/labels.headers
+```
+
+## Setup
+
+For licensed tasks, set the TotalSegmentator key as `TOTALSEG_LICENSE`. The
+service forwards it to `totalsegmentator(license_number=...)` automatically
+when set; absent the env var, licensed tasks fail with TS's own message.
+
+```bash
+bld config:set -a dicom-imager-segmenter TOTALSEG_LICENSE=aca_xxxxx
 ```
 
 ## Deploy (Build.io)

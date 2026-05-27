@@ -64,7 +64,9 @@ def run_segmentation(
 
         t1 = time.time()
         # ml=True returns a single multilabel NIfTI rather than per-class masks.
-        _ts()(
+        # license_number is passed to TS when set so licensed tasks (e.g.
+        # thigh_shoulder_muscles, tissue_types) can download their weights.
+        ts_kwargs = dict(
             input=str(in_path),
             output=str(out_path),
             task=base_task,
@@ -73,6 +75,9 @@ def run_segmentation(
             body_seg=body_seg,
             quiet=True,
         )
+        if os.environ.get("TOTALSEG_LICENSE"):
+            ts_kwargs["license_number"] = os.environ["TOTALSEG_LICENSE"]
+        _ts()(**ts_kwargs)
         seg_s = time.time() - t1
 
         t2 = time.time()
