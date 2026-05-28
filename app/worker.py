@@ -1,0 +1,120 @@
+"""RQ worker entrypoint + job function.
+
+Run with: `python -m app.worker`
+  (loops forever, sending a heartbeat to Redis between jobs so /healthz/worker
+  can report liveness.)
+
+The job function `run_job` is what gets enqueued by the web dyno; it reads the
+input NIfTI from S3, runs TotalSegmentator, writes the labels NIfTI back to S3,
+and updates the job hash in Redis.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import sys
+import time
+
+from redis import Redis
+from rq import Queue, Worker
+
+from .infra import (
+    QUEUE_NAME,
+    get_s3,
+    job_set,
+    redis_url,
+    s3_input_key,
+    s3_labels_key,
+    worker_heartbeat,
+)
+from .segment import run_segmentation
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+log = logging.getLogger("segmenter.worker")
+
+
+# RQ job function. Must be importable by the worker (it is — `app.worker.run_job`).
+def run_job(job_id: str, task: str, body_seg: bool, roi_subset: list[str] | None) -> dict:
+    log.info("job=%s start task=%s body_seg=%s roi_subset=%s", job_id, task, body_seg, roi_subset)
+    job_set(job_id, state="running", started_at=time.time())
+    worker_heartbeat()
+
+    s3 = get_s3()
+    bucket = os.environ["AWS_S3_BUCKET"]
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=s3_input_key(job_id))
+        nifti_bytes = obj["Body"].read()
+        log.info("job=%s pulled %d bytes from s3", job_id, len(nifti_bytes))
+
+        labels_bytes, summary = run_segmentation(
+            nifti_bytes, task=task, body_seg=body_seg, roi_subset=roi_subset
+        )
+
+        s3.put_object(
+            Bucket=bucket,
+            Key=s3_labels_key(job_id),
+            Body=labels_bytes,
+            ContentType="application/gzip",
+        )
+        log.info("job=%s wrote %d label bytes to s3", job_id, len(labels_bytes))
+
+        job_set(
+            job_id,
+            state="done",
+            summary=summary,
+            finished_at=time.time(),
+            labels_bytes=len(labels_bytes),
+        )
+        worker_heartbeat()
+        return summary
+    except BaseException as exc:  # noqa: BLE001 — TS calls sys.exit() on license errors; catch BaseException so we record the failure rather than dying silently with state=running.
+        log.exception("job=%s failed", job_id)
+        job_set(
+            job_id,
+            state="error",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at=time.time(),
+        )
+        worker_heartbeat()
+        raise
+
+
+def _make_connection() -> Redis:
+    url = redis_url()
+    kwargs: dict = {}
+    if url.startswith("rediss://"):
+        kwargs["ssl_cert_reqs"] = None
+    return Redis.from_url(url, **kwargs)
+
+
+def main():
+    conn = _make_connection()
+    queue = Queue(QUEUE_NAME, connection=conn, default_timeout=3600)
+
+    # Heartbeat every time the worker loops. RQ doesn't give us a hook for
+    # idle-loop callbacks, so we wrap the worker to write a heartbeat on
+    # startup; the run_job path also heartbeats while a job runs.
+    worker_heartbeat()
+    log.info("worker starting, listening on queue=%s", QUEUE_NAME)
+
+    # Forward SIGTERM cleanly so bld restarts/deploys don't leave half-done jobs
+    # in a "running" state forever — RQ's death handler will mark the job failed
+    # when the worker exits mid-job.
+    def _term(signum, frame):
+        log.info("worker received signal=%s, exiting", signum)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _term)
+
+    worker = Worker([queue], connection=conn)
+    # with_scheduler=False keeps things simple. We don't need delayed jobs.
+    worker.work(with_scheduler=False, logging_level=os.environ.get("LOG_LEVEL", "INFO"))
+
+
+if __name__ == "__main__":
+    main()

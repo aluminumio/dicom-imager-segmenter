@@ -5,3 +5,6 @@ python-multipart==0.0.18
 nibabel==5.3.2
 numpy<2
 TotalSegmentator==2.4.0
+rq==1.16.2
+redis==5.0.8
+boto3==1.35.36
