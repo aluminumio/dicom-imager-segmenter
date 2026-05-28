@@ -43,6 +43,7 @@ def run_segmentation(
     nifti_bytes: bytes,
     task: str = "total_fast",
     body_seg: bool = False,
+    roi_subset: list[str] | None = None,
 ) -> tuple[bytes, dict]:
     """Run TotalSegmentator on a NIfTI scan.
 
@@ -77,6 +78,8 @@ def run_segmentation(
         )
         if os.environ.get("TOTALSEG_LICENSE"):
             ts_kwargs["license_number"] = os.environ["TOTALSEG_LICENSE"]
+        if roi_subset:
+            ts_kwargs["roi_subset"] = roi_subset
         _ts()(**ts_kwargs)
         seg_s = time.time() - t1
 
@@ -103,6 +106,7 @@ def run_segmentation(
         "base_task": base_task,
         "fast": fast,
         "body_seg": body_seg,
+        "roi_subset": roi_subset,
         "shape": list(img.shape),
         "spacing_mm": [float(x) for x in img.header.get_zooms()[:3]],
         "timings": {

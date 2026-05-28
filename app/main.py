@@ -46,12 +46,12 @@ def _ts_version() -> str:
         return "unknown"
 
 
-def _worker(job_id: str, data: bytes, task: str, body_seg: bool):
+def _worker(job_id: str, data: bytes, task: str, body_seg: bool, roi_subset: list[str] | None):
     job = _JOBS[job_id]
     job["state"] = "running"
     job["started_at"] = time.time()
     try:
-        labels, summary = run_segmentation(data, task=task, body_seg=body_seg)
+        labels, summary = run_segmentation(data, task=task, body_seg=body_seg, roi_subset=roi_subset)
         labels_path = _JOBS_DIR / f"{job_id}.nii.gz"
         labels_path.write_bytes(labels)
         job["summary"] = summary
@@ -85,9 +85,16 @@ async def segment(
     nifti: UploadFile = File(...),
     task: str = Form("total_fast"),
     body_seg: bool = Form(False),
+    roi_subset: str = Form(""),
 ):
     if not nifti.filename:
         raise HTTPException(status_code=400, detail="missing nifti upload")
+
+    # Comma-separated class-name list: forces TS to predict only these classes
+    # (everything else becomes background). Lets callers anchor a partial-FOV
+    # scan (e.g. shoulder-only CT) to the right anatomy so the model can't
+    # confuse a humerus for a femur etc.
+    roi_list = [c.strip() for c in roi_subset.split(",") if c.strip()] or None
 
     data = await nifti.read()
     job_id = uuid.uuid4().hex
@@ -95,13 +102,15 @@ async def segment(
         "state": "pending",
         "task": task,
         "body_seg": body_seg,
+        "roi_subset": roi_list,
         "input_bytes": len(data),
         "created_at": time.time(),
     }
-    log.info("queue job=%s task=%s body_seg=%s bytes=%d", job_id, task, body_seg, len(data))
+    log.info("queue job=%s task=%s body_seg=%s roi_subset=%s bytes=%d",
+             job_id, task, body_seg, len(roi_list) if roi_list else 0, len(data))
 
     threading.Thread(
-        target=_worker, args=(job_id, data, task, body_seg), daemon=True
+        target=_worker, args=(job_id, data, task, body_seg, roi_list), daemon=True
     ).start()
     return {"job_id": job_id, "state": "pending"}
 
