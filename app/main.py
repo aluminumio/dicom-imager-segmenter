@@ -46,12 +46,12 @@ def _ts_version() -> str:
         return "unknown"
 
 
-def _worker(job_id: str, data: bytes, task: str, body_seg: bool, roi_subset: list[str] | None):
+def _worker(job_id: str, data: bytes, task: str, body_seg: bool, roi_subset: list[str] | None, body_part: str | None):
     job = _JOBS[job_id]
     job["state"] = "running"
     job["started_at"] = time.time()
     try:
-        labels, summary = run_segmentation(data, task=task, body_seg=body_seg, roi_subset=roi_subset)
+        labels, summary = run_segmentation(data, task=task, body_seg=body_seg, roi_subset=roi_subset, body_part=body_part)
         labels_path = _JOBS_DIR / f"{job_id}.nii.gz"
         labels_path.write_bytes(labels)
         job["summary"] = summary
@@ -86,6 +86,7 @@ async def segment(
     task: str = Form("total_fast"),
     body_seg: bool = Form(False),
     roi_subset: str = Form(""),
+    body_part: str = Form(""),
 ):
     if not nifti.filename:
         raise HTTPException(status_code=400, detail="missing nifti upload")
@@ -96,6 +97,8 @@ async def segment(
     # confuse a humerus for a femur etc.
     roi_list = [c.strip() for c in roi_subset.split(",") if c.strip()] or None
 
+    bp = body_part.strip() or None
+
     data = await nifti.read()
     job_id = uuid.uuid4().hex
     _JOBS[job_id] = {
@@ -103,14 +106,15 @@ async def segment(
         "task": task,
         "body_seg": body_seg,
         "roi_subset": roi_list,
+        "body_part": bp,
         "input_bytes": len(data),
         "created_at": time.time(),
     }
-    log.info("queue job=%s task=%s body_seg=%s roi_subset=%s bytes=%d",
-             job_id, task, body_seg, len(roi_list) if roi_list else 0, len(data))
+    log.info("queue job=%s task=%s body_seg=%s roi_subset=%s body_part=%s bytes=%d",
+             job_id, task, body_seg, len(roi_list) if roi_list else 0, bp, len(data))
 
     threading.Thread(
-        target=_worker, args=(job_id, data, task, body_seg, roi_list), daemon=True
+        target=_worker, args=(job_id, data, task, body_seg, roi_list, bp), daemon=True
     ).start()
     return {"job_id": job_id, "state": "pending"}
 

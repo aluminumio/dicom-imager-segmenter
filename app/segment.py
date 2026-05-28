@@ -32,6 +32,57 @@ LICENSED_TASKS = {
 }
 
 
+# Body-part-driven label remap. TotalSegmentator's `total` / `total_fast`
+# models confidently mislabel anatomy on tight FOVs because the network can't
+# disambiguate without spine/pelvis context. We can fix the *names* — the
+# pixel locations are usually right — by remapping known confusions per
+# DICOM BodyPartExamined. Format: {body_part_upper: {wrong_name: right_name}}.
+#
+# Right names MUST exist in the active task's class_map (so the renderer
+# / downstream consumers find them). For shoulder, humerus_*/scapula_*/
+# clavicula_* are present in the `total` 117-class set — so we can remap
+# the model's wrong femur_*/hip_* choices into them.
+BODY_PART_REMAP = {
+    "SHOULDER": {
+        "femur_left":   "humerus_left",
+        "femur_right":  "humerus_right",
+        "hip_left":     "scapula_left",
+        "hip_right":    "scapula_right",
+        # gluteus_maximus_left/right on a shoulder CT IS the deltoid; we
+        # leave it named gluteus_maximus_* because TS has no deltoid class
+        # and inventing a new id would confuse the renderer. Caller-side
+        # display logic can show it as "shoulder muscle (deltoid)".
+    },
+}
+
+
+def _apply_body_part_remap(labels: "np.ndarray", base_task: str, body_part: str | None) -> dict[int, int]:
+    """In-place remap labels per body_part's known-confusion table.
+
+    Returns the {source_id: target_id} mapping actually applied (for the
+    summary). No-op when body_part is empty/unknown or no remap defined.
+    """
+    if not body_part:
+        return {}
+    table = BODY_PART_REMAP.get(body_part.upper())
+    if not table:
+        return {}
+    from totalsegmentator.map_to_binary import class_map
+    cmap = class_map.get(base_task, {})
+    if not cmap:
+        return {}
+    name_to_id = {v: k for k, v in cmap.items()}
+    applied: dict[int, int] = {}
+    for src_name, dst_name in table.items():
+        src_id = name_to_id.get(src_name)
+        dst_id = name_to_id.get(dst_name)
+        if src_id is None or dst_id is None:
+            continue
+        labels[labels == src_id] = dst_id
+        applied[src_id] = dst_id
+    return applied
+
+
 # Lazy import — keeps app importable for /healthz even if torch hasn't
 # finished setting up (e.g. during cold start).
 _TS = None
@@ -59,6 +110,7 @@ def run_segmentation(
     task: str = "total_fast",
     body_seg: bool = False,
     roi_subset: list[str] | None = None,
+    body_part: str | None = None,
 ) -> tuple[bytes, dict]:
     """Run TotalSegmentator on a NIfTI scan.
 
@@ -101,6 +153,13 @@ def run_segmentation(
         t2 = time.time()
         labels_img = nib.load(str(out_path))
         labels = np.asanyarray(labels_img.dataobj).astype(np.int32)
+        remap_applied = _apply_body_part_remap(labels, base_task, body_part)
+        if remap_applied:
+            # Rewrite the on-disk NIfTI so downstream consumers (overlay
+            # renderer in Rails) see the remapped class ids. Preserve the
+            # original affine + header.
+            nib.Nifti1Image(labels.astype(np.int16), labels_img.affine,
+                            labels_img.header).to_filename(str(out_path))
         ids, counts = np.unique(labels, return_counts=True)
         cmap = _class_map(base_task)
         nonzero = [
@@ -122,6 +181,8 @@ def run_segmentation(
         "fast": fast,
         "body_seg": body_seg,
         "roi_subset": roi_subset,
+        "body_part": body_part,
+        "remap_applied": remap_applied,
         "shape": list(img.shape),
         "spacing_mm": [float(x) for x in img.header.get_zooms()[:3]],
         "timings": {
