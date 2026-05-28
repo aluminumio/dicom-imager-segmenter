@@ -17,6 +17,21 @@ import nibabel as nib
 import numpy as np
 
 
+# TS treats `license_number` as a hard requirement: when set, it validates
+# against the task's entitlement. Free tasks reject any license_number (even
+# a valid one) with "Invalid license number" because they don't have an
+# entitlement record. So only forward our key when the task actually needs it.
+LICENSED_TASKS = {
+    "appendicular_bones",
+    "tissue_types",
+    "tissue_types_mr",
+    "tissue_4_types",
+    "vertebrae_body",
+    "thigh_shoulder_muscles",
+    "thigh_shoulder_muscles_mr",
+}
+
+
 # Lazy import — keeps app importable for /healthz even if torch hasn't
 # finished setting up (e.g. during cold start).
 _TS = None
@@ -76,7 +91,7 @@ def run_segmentation(
             body_seg=body_seg,
             quiet=True,
         )
-        if os.environ.get("TOTALSEG_LICENSE"):
+        if base_task in LICENSED_TASKS and os.environ.get("TOTALSEG_LICENSE"):
             ts_kwargs["license_number"] = os.environ["TOTALSEG_LICENSE"]
         if roi_subset:
             ts_kwargs["roi_subset"] = roi_subset

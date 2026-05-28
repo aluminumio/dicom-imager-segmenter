@@ -57,9 +57,9 @@ def _worker(job_id: str, data: bytes, task: str, body_seg: bool, roi_subset: lis
         job["summary"] = summary
         job["labels_path"] = str(labels_path)
         job["state"] = "done"
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001 — TS calls sys.exit() on license errors, which raises SystemExit (not Exception). Catch BaseException so the job is marked as error rather than the worker thread dying silently and leaving "state": "running" forever.
         log.exception("job %s failed", job_id)
-        job["error"] = str(exc)
+        job["error"] = f"{type(exc).__name__}: {exc}"
         job["state"] = "error"
     finally:
         job["finished_at"] = time.time()
