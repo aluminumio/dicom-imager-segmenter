@@ -75,8 +75,19 @@ def _body_mask_scrub(in_path: Path) -> tuple[int, float]:
     from scipy import ndimage
 
     img = nib.load(str(in_path))
-    rescale_slope = float(img.header.get("scl_slope") or 1.0)
-    rescale_inter = float(img.header.get("scl_inter") or 0.0)
+    # NIfTIs written without rescale return NaN here (the spec encodes
+    # "unset" as NaN in the float field). NaN is truthy, so `... or 1.0`
+    # silently passes NaN through and downstream `round(NaN)` raises.
+    def _finite(val, default):
+        try:
+            f = float(val)
+            return f if np.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
+    rescale_slope = _finite(img.header.get("scl_slope"), 1.0)
+    if rescale_slope == 0.0:
+        rescale_slope = 1.0
+    rescale_inter = _finite(img.header.get("scl_inter"), 0.0)
     raw = np.asanyarray(img.dataobj).astype(np.float32)
     hu = raw * rescale_slope + rescale_inter
 
