@@ -83,6 +83,8 @@ def run_segmentation(
         # ml=True returns a single multilabel NIfTI rather than per-class masks.
         # license_number is passed to TS when set so licensed tasks (e.g.
         # thigh_shoulder_muscles, tissue_types) can download their weights.
+        # quiet=False during the work-horse-death investigation: we want TS's
+        # own stdout/stderr in the log so we can see what step it printed last.
         ts_kwargs = dict(
             input=str(in_path),
             output=str(out_path),
@@ -90,13 +92,49 @@ def run_segmentation(
             fast=fast,
             ml=True,
             body_seg=body_seg,
-            quiet=True,
+            quiet=False,
         )
         if base_task in LICENSED_TASKS and os.environ.get("TOTALSEG_LICENSE"):
             ts_kwargs["license_number"] = os.environ["TOTALSEG_LICENSE"]
         if roi_subset:
             ts_kwargs["roi_subset"] = roi_subset
-        _ts()(**ts_kwargs)
+
+        # ---- INSTRUMENTATION: RSS sampler thread + try/except around TS call.
+        # When the work-horse dies the parent RQ worker logs the signal status;
+        # the sampler tells us what RSS looked like just before the death.
+        import resource as _res
+        import threading as _thr
+        _stop = _thr.Event()
+        def _sample():
+            while not _stop.is_set():
+                self_kb = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+                kids_kb = _res.getrusage(_res.RUSAGE_CHILDREN).ru_maxrss
+                try:
+                    with open("/proc/self/status") as f:
+                        vmrss = next((l for l in f if l.startswith("VmRSS:")), "").strip()
+                except OSError:
+                    vmrss = ""
+                print(
+                    f"PROBE-TS rss_self_MB={self_kb/1024:.0f} "
+                    f"rss_children_MB={kids_kb/1024:.0f} {vmrss}",
+                    flush=True,
+                )
+                _stop.wait(1.0)
+        _sampler = _thr.Thread(target=_sample, daemon=True, name="rss-sampler")
+        _sampler.start()
+        print(f"PROBE-TS calling totalsegmentator(task={base_task}, fast={fast}) "
+              f"input_shape={tuple(img.shape)} spacing={tuple(img.header.get_zooms()[:3])}",
+              flush=True)
+        try:
+            _ts()(**ts_kwargs)
+            print("PROBE-TS totalsegmentator() returned cleanly", flush=True)
+        except BaseException as _e:
+            print(f"PROBE-TS totalsegmentator() raised "
+                  f"{type(_e).__name__}: {_e}", flush=True)
+            raise
+        finally:
+            _stop.set()
+            _sampler.join(timeout=2)
         seg_s = time.time() - t1
 
         t2 = time.time()
