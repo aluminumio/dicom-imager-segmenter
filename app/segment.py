@@ -56,16 +56,21 @@ def _class_map(task: str) -> dict[int, str]:
 
 
 def _body_mask_scrub(in_path: Path) -> tuple[int, float]:
-    """Zero everything outside a body mask in-place, slice by slice.
+    """Zero everything outside a body mask in-place.
 
     Many shoulder CTs ship with burned-in annotations: white text at the
     corners (patient name, scanner settings), orientation cubes, R/L
     markers. Those pixels carry bone-range HU values, and TotalSegmentator
     treats them as anatomy — both wasting compute and corrupting context
-    around the real bones. We threshold each axial slice at HU > -300
-    (tissue + bone), keep the largest connected component, close internal
-    holes, and reset everything else to air (-1024). Returns (kept_voxels,
-    fraction_zeroed) for logging.
+    around the real bones.
+
+    Strategy: compute a per-slice in-plane body mask (HU > -300, the
+    connected component containing the image center), OR them together
+    across z into a single 2D mask, then close + fill holes. Apply that
+    same 2D mask to every slice. A single mask across the volume means
+    the boundary doesn't flicker slice-to-slice and the corner regions
+    (fixed in image-pixel coords) get killed identically everywhere.
+    Returns (kept_voxels, fraction_zeroed) for logging.
     """
     from scipy import ndimage
 
@@ -75,20 +80,29 @@ def _body_mask_scrub(in_path: Path) -> tuple[int, float]:
     raw = np.asanyarray(img.dataobj).astype(np.float32)
     hu = raw * rescale_slope + rescale_inter
 
-    keep = np.zeros(hu.shape, dtype=bool)
-    for z in range(hu.shape[2]):
+    H, W, D = hu.shape
+    cy, cx = H // 2, W // 2
+    union = np.zeros((H, W), dtype=bool)
+    for z in range(D):
         slc = hu[:, :, z] > -300.0
         if not slc.any():
             continue
         labeled, n = ndimage.label(slc)
         if n == 0:
             continue
-        sizes = ndimage.sum(slc, labeled, range(1, n + 1))
-        biggest = int(np.argmax(sizes)) + 1
-        body = labeled == biggest
-        body = ndimage.binary_closing(body, iterations=3)
-        body = ndimage.binary_fill_holes(body)
-        keep[:, :, z] = body
+        # Body is the component containing the image center. Falling back
+        # to the largest component if center isn't tissue (unusual — would
+        # happen on a near-empty slice) keeps coverage on the early/late
+        # slices where the body cross-section is small.
+        center_label = int(labeled[cy, cx])
+        if center_label == 0:
+            sizes = ndimage.sum(slc, labeled, range(1, n + 1))
+            center_label = int(np.argmax(sizes)) + 1
+        union |= (labeled == center_label)
+
+    union = ndimage.binary_closing(union, iterations=4)
+    union = ndimage.binary_fill_holes(union)
+    keep = np.broadcast_to(union[:, :, None], hu.shape)
 
     # Reset air outside body. Use the original storage dtype: if the data
     # was stored unsigned (e.g. uint16 with intercept), -1024 HU maps to
