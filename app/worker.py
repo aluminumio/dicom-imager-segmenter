@@ -93,57 +93,53 @@ def _make_connection() -> Redis:
 
 
 def _log_resource_limits():
-    """Log the worker process's actual resource limits as the kernel sees them.
+    """Print the worker process's actual resource limits at boot.
 
     `bld ps:exec` runs in a sibling cgroup with its own (small) limits, so it
-    can't be used to discover the worker's real cap. Print everything here
-    once at boot so the log captures what the kernel will enforce against us.
+    can't be used to discover the worker's real cap. We `print()` rather than
+    `log.info()` because RQ configures the root logger at import time, which
+    causes our subsequent `logging.basicConfig` to no-op and our log.info()
+    calls to disappear silently.
     """
     import resource
-    log.info("=== worker resource probe ===")
-    # POSIX rlimits the kernel will enforce on this process
+    print("=== PROBE: worker resource probe ===", flush=True)
     for name in ("RLIMIT_AS", "RLIMIT_DATA", "RLIMIT_RSS", "RLIMIT_STACK",
                  "RLIMIT_CPU", "RLIMIT_NOFILE", "RLIMIT_NPROC", "RLIMIT_MEMLOCK",
                  "RLIMIT_CORE"):
         try:
             soft, hard = resource.getrlimit(getattr(resource, name))
-            log.info("rlimit %s: soft=%s hard=%s", name, soft, hard)
+            print(f"PROBE rlimit {name}: soft={soft} hard={hard}", flush=True)
         except (ValueError, AttributeError):
             pass
-    # /proc/self/cgroup tells us our actual cgroup path; with that we can read
-    # memory.max from the right place rather than the exec-session's view.
     try:
         with open("/proc/self/cgroup") as f:
-            log.info("/proc/self/cgroup: %s", f.read().strip())
+            print(f"PROBE /proc/self/cgroup: {f.read().strip()}", flush=True)
     except OSError as e:
-        log.info("cgroup read failed: %s", e)
-    # Walk the cgroup memory.max file directly. In cgroup v2 unified hierarchy,
-    # /sys/fs/cgroup/memory.max is OUR cgroup's max (or "max" for unlimited).
+        print(f"PROBE cgroup read failed: {e}", flush=True)
     for path in ("/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory.high",
                  "/sys/fs/cgroup/memory.current",
-                 "/sys/fs/cgroup/cpu.max"):
+                 "/sys/fs/cgroup/memory.swap.max",
+                 "/sys/fs/cgroup/cpu.max",
+                 "/sys/fs/cgroup/pids.max"):
         try:
             with open(path) as f:
-                log.info("%s = %s", path, f.read().strip())
+                print(f"PROBE {path} = {f.read().strip()}", flush=True)
         except OSError:
             pass
-    # OOM score adjustment — if -1000 we're protected, if 0 default, if 1000
-    # the kernel will pick us first when something has to die.
     try:
         with open("/proc/self/oom_score_adj") as f:
-            log.info("oom_score_adj = %s", f.read().strip())
+            print(f"PROBE oom_score_adj = {f.read().strip()}", flush=True)
     except OSError:
         pass
-    # Snapshot of available system memory at startup.
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith(("MemTotal:", "MemAvailable:", "MemFree:", "SwapTotal:")):
-                    log.info("meminfo: %s", line.strip())
+                    print(f"PROBE meminfo: {line.strip()}", flush=True)
     except OSError:
         pass
-    log.info("=== end resource probe ===")
+    print("=== PROBE: end resource probe ===", flush=True)
 
 
 def main():
