@@ -72,8 +72,17 @@ def probe_memory_job(job_id: str, max_gb: int = 8) -> dict:
 
 
 # RQ job function. Must be importable by the worker (it is — `app.worker.run_job`).
-def run_job(job_id: str, task: str, body_seg: bool, roi_subset: list[str] | None) -> dict:
-    log.info("job=%s start task=%s body_seg=%s roi_subset=%s", job_id, task, body_seg, roi_subset)
+def run_job(
+    job_id: str,
+    task: str,
+    body_seg: bool,
+    roi_subset: list[str] | None,
+    body_part: str | None = None,
+) -> dict:
+    log.info(
+        "job=%s start task=%s body_seg=%s roi_subset=%s body_part=%s",
+        job_id, task, body_seg, roi_subset, body_part or "-",
+    )
     job_set(job_id, state="running", started_at=time.time())
     worker_heartbeat()
 
@@ -85,7 +94,9 @@ def run_job(job_id: str, task: str, body_seg: bool, roi_subset: list[str] | None
         log.info("job=%s pulled %d bytes from s3", job_id, len(nifti_bytes))
 
         labels_bytes, summary = run_segmentation(
-            nifti_bytes, task=task, body_seg=body_seg, roi_subset=roi_subset
+            nifti_bytes,
+            task=task, body_seg=body_seg, roi_subset=roi_subset,
+            body_part=body_part,
         )
 
         s3.put_object(

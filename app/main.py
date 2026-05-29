@@ -97,6 +97,7 @@ async def segment(
     task: str = Form("total_fast"),
     body_seg: bool = Form(False),
     roi_subset: str = Form(""),
+    body_part: str = Form(""),
 ):
     if not nifti.filename:
         raise HTTPException(status_code=400, detail="missing nifti upload")
@@ -129,6 +130,7 @@ async def segment(
         task=task,
         body_seg=body_seg,
         roi_subset=roi_list or [],
+        body_part=body_part or "",
         input_bytes=len(data),
         created_at=time.time(),
     )
@@ -138,15 +140,16 @@ async def segment(
     # payload bigger and harder to inspect in `rq info`.
     get_queue().enqueue(
         "app.worker.run_job",
-        job_id, task, body_seg, roi_list,
+        job_id, task, body_seg, roi_list, body_part or None,
         job_id=job_id,  # RQ's own job id == ours, makes redis introspection easier
         result_ttl=7 * 24 * 3600,
         failure_ttl=7 * 24 * 3600,
     )
 
     log.info(
-        "queue job=%s task=%s body_seg=%s roi_subset=%s bytes=%d",
-        job_id, task, body_seg, len(roi_list) if roi_list else 0, len(data),
+        "queue job=%s task=%s body_seg=%s roi_subset=%s body_part=%s bytes=%d",
+        job_id, task, body_seg, len(roi_list) if roi_list else 0,
+        body_part or "-", len(data),
     )
     return {"job_id": job_id, "state": "pending"}
 

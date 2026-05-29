@@ -55,16 +55,74 @@ def _class_map(task: str) -> dict[int, str]:
         return {}
 
 
+def _body_mask_scrub(in_path: Path) -> tuple[int, float]:
+    """Zero everything outside a body mask in-place, slice by slice.
+
+    Many shoulder CTs ship with burned-in annotations: white text at the
+    corners (patient name, scanner settings), orientation cubes, R/L
+    markers. Those pixels carry bone-range HU values, and TotalSegmentator
+    treats them as anatomy — both wasting compute and corrupting context
+    around the real bones. We threshold each axial slice at HU > -300
+    (tissue + bone), keep the largest connected component, close internal
+    holes, and reset everything else to air (-1024). Returns (kept_voxels,
+    fraction_zeroed) for logging.
+    """
+    from scipy import ndimage
+
+    img = nib.load(str(in_path))
+    rescale_slope = float(img.header.get("scl_slope") or 1.0)
+    rescale_inter = float(img.header.get("scl_inter") or 0.0)
+    raw = np.asanyarray(img.dataobj).astype(np.float32)
+    hu = raw * rescale_slope + rescale_inter
+
+    keep = np.zeros(hu.shape, dtype=bool)
+    for z in range(hu.shape[2]):
+        slc = hu[:, :, z] > -300.0
+        if not slc.any():
+            continue
+        labeled, n = ndimage.label(slc)
+        if n == 0:
+            continue
+        sizes = ndimage.sum(slc, labeled, range(1, n + 1))
+        biggest = int(np.argmax(sizes)) + 1
+        body = labeled == biggest
+        body = ndimage.binary_closing(body, iterations=3)
+        body = ndimage.binary_fill_holes(body)
+        keep[:, :, z] = body
+
+    # Reset air outside body. Use the original storage dtype: if the data
+    # was stored unsigned (e.g. uint16 with intercept), -1024 HU maps to
+    # the raw value 0 only if intercept is -1024 exactly — close enough for
+    # nnUNet's preprocessing. Otherwise we write the HU-equivalent raw.
+    air_raw = (-1024.0 - rescale_inter) / rescale_slope if rescale_slope else 0.0
+    out_dtype = img.get_data_dtype()
+    if np.issubdtype(out_dtype, np.integer):
+        air_raw = np.clip(round(air_raw), np.iinfo(out_dtype).min, np.iinfo(out_dtype).max)
+    raw[~keep] = air_raw
+    nib.save(nib.Nifti1Image(raw.astype(out_dtype), img.affine, img.header), str(in_path))
+
+    kept = int(keep.sum())
+    zeroed_frac = 1.0 - (kept / keep.size)
+    return kept, zeroed_frac
+
+
 def run_segmentation(
     nifti_bytes: bytes,
     task: str = "total_fast",
     body_seg: bool = False,
     roi_subset: list[str] | None = None,
+    body_part: str | None = None,
+    preprocess: bool = True,
 ) -> tuple[bytes, dict]:
     """Run TotalSegmentator on a NIfTI scan.
 
     Returns (labels_nii_gz_bytes, summary_dict).
     Summary contains: task, timings, nonzero_counts (sorted desc), shape, spacing.
+
+    preprocess=True (default) runs `_body_mask_scrub` first to eliminate
+    burned-in annotations. body_part is logged but not yet used to constrain
+    TS — the model doesn't have a body-part conditioning input; this hint
+    is staged for future post-hoc constrained argmax.
     """
     fast = task.endswith("_fast")
     base_task = task[:-5] if fast else task
@@ -78,6 +136,13 @@ def run_segmentation(
         t0 = time.time()
         img = nib.load(str(in_path))
         load_s = time.time() - t0
+
+        scrub_s = 0.0
+        scrub_kept = None
+        if preprocess:
+            tp = time.time()
+            scrub_kept, _ = _body_mask_scrub(in_path)
+            scrub_s = round(time.time() - tp, 3)
 
         t1 = time.time()
         ts_kwargs = dict(
@@ -120,10 +185,14 @@ def run_segmentation(
         "fast": fast,
         "body_seg": body_seg,
         "roi_subset": roi_subset,
+        "body_part": body_part,
+        "preprocess": preprocess,
+        "scrub_kept_voxels": scrub_kept,
         "shape": list(img.shape),
         "spacing_mm": [float(x) for x in img.header.get_zooms()[:3]],
         "timings": {
             "load_s": round(load_s, 3),
+            "scrub_s": scrub_s,
             "segmentation_s": round(seg_s, 3),
             "read_back_s": round(read_s, 3),
         },
