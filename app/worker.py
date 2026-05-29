@@ -38,6 +38,39 @@ logging.basicConfig(
 log = logging.getLogger("segmenter.worker")
 
 
+# Empirical memory probe: a job that allocates 100 MB chunks of numpy arrays
+# until something kills the process. Tells us where the actual wall is, vs the
+# user-reported 32 GB available / 46 GB cgroup cap. Trigger by enqueuing:
+#   curl -X POST https://segmenter.rightimaged.com/probe_memory
+# (the matching endpoint is in app/main.py)
+def probe_memory_job(job_id: str, max_gb: int = 8) -> dict:
+    import gc
+    import resource as _resource
+    print(f"PROBE-MEM job={job_id} start max_gb={max_gb}", flush=True)
+    def _rss_mb():
+        return _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024
+    import numpy as np
+    chunks: list = []
+    chunk_size_mb = 100
+    target_mb = max_gb * 1024
+    try:
+        mb = 0
+        while mb < target_mb:
+            chunks.append(np.ones(chunk_size_mb * 1024 * 1024, dtype=np.uint8))
+            mb += chunk_size_mb
+            # Touch every page so it's actually resident, not just mmap'd.
+            chunks[-1][::4096] = 1
+            print(f"PROBE-MEM allocated_MB={mb} ru_maxrss_MB={_rss_mb():.0f}", flush=True)
+        print(f"PROBE-MEM completed without death; reached {target_mb} MB", flush=True)
+    except MemoryError as e:
+        print(f"PROBE-MEM MemoryError at allocated_MB={mb}: {e}", flush=True)
+        raise
+    finally:
+        del chunks
+        gc.collect()
+    return {"reached_mb": mb}
+
+
 # RQ job function. Must be importable by the worker (it is — `app.worker.run_job`).
 def run_job(job_id: str, task: str, body_seg: bool, roi_subset: list[str] | None) -> dict:
     log.info("job=%s start task=%s body_seg=%s roi_subset=%s", job_id, task, body_seg, roi_subset)

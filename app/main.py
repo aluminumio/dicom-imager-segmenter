@@ -151,6 +151,26 @@ async def segment(
     return {"job_id": job_id, "state": "pending"}
 
 
+@app.post("/probe_memory")
+def probe_memory(max_gb: int = 8):
+    """Empirical memory test: queue a job that allocates max_gb of numpy arrays.
+
+    Use to find what actually clamps the worker. The job prints RSS every
+    100 MB and dies whenever the kernel/runtime decides to kill it.
+    """
+    job_id = uuid.uuid4().hex
+    job_set(job_id, state="pending", task="probe_memory", created_at=time.time())
+    get_queue().enqueue(
+        "app.worker.probe_memory_job",
+        job_id, max_gb,
+        job_id=job_id,
+        result_ttl=3600,
+        failure_ttl=3600,
+    )
+    log.info("queue probe job=%s max_gb=%d", job_id, max_gb)
+    return {"job_id": job_id, "state": "pending"}
+
+
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     job = job_get(job_id)
