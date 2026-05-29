@@ -181,10 +181,19 @@ def main():
 
     _log_resource_limits()
 
-    # Heartbeat every time the worker loops. RQ doesn't give us a hook for
-    # idle-loop callbacks, so we wrap the worker to write a heartbeat on
-    # startup; the run_job path also heartbeats while a job runs.
-    worker_heartbeat()
+    # RQ has no idle-loop hook, so a daemon thread ticks the heartbeat every
+    # 30s. Without this the 60s-TTL key expires whenever the worker is idle
+    # (most of the time) or busy in a long job (TS predict can take minutes),
+    # which makes /healthz/worker falsely report the worker dead.
+    import threading as _thr
+    def _heartbeat_loop():
+        while True:
+            try:
+                worker_heartbeat()
+            except Exception:
+                pass
+            time.sleep(30)
+    _thr.Thread(target=_heartbeat_loop, daemon=True, name="hb-tick").start()
     log.info("worker starting, listening on queue=%s", QUEUE_NAME)
 
     # Forward SIGTERM cleanly so bld restarts/deploys don't leave half-done jobs
